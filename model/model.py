@@ -13,6 +13,7 @@ class Configuration:
     n_layer : int = 12
     n_head : int = 12
     n_inner : int = 3072
+    n_swi : int = 2048
 
 
 class RoPE(nn.Module):
@@ -45,19 +46,30 @@ class RoPE(nn.Module):
     def forward(self, q, k):
         return self.rotate(q), self.rotate(k)
     
+    
+class SwiGLU(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.w= nn.Linear(config.n_embd, config.n_swi, bias=False) # *8/3 to control the nunmber of paramters
+        self.v = nn.Linear(config.n_embd, config.n_swi, bias=False)
+        self.proj = nn.Linear(config.n_swi, config.n_embd, bias=False)
+    
+    def forward(self, x):
+        gate = F.silu(self.w(x)) 
+        content = self.v(x)
+        x = self.proj(gate * content)
+        return x
+
 
 class ffw(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.proj1 = nn.Linear(config.n_embd, config.n_inner)
-        self.gelu = nn.GELU(approximate='tanh')
-        self.proj2 = nn.Linear(config.n_inner, config.n_embd)
+        self.swiglu = SwiGLU(config)
     
     def forward(self, x):
-        x = self.proj1(x)
-        x = self.gelu(x)
-        x = self.proj2(x)
+        x = self.swiglu(x)
         return x
     
 
@@ -65,8 +77,8 @@ class attention(nn.Module):
     
     def __init__(self, config):
         super().__init__()
-        self.atten = nn.Linear (config.n_embd, 3*config.n_embd)  #qkv
-        self.lproj = nn.Linear (config.n_embd, config.n_embd)
+        self.atten = nn.Linear (config.n_embd, 3*config.n_embd,bias=False)  #qkv
+        self.lproj = nn.Linear (config.n_embd, config.n_embd,bias=False)
         self.n_embd = config.n_embd
         self.n_head = config.n_head
         self.head_size =  self.n_embd // self.n_head
@@ -240,7 +252,7 @@ def train():
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                torch.save(model.state_dict(), os.path.join(data_config.out_dir, 'best_model.pt'))
+                torch.save(model.state_dict(), os.path.join(data_config.out_dir, 'best_model1.pt'))
 
 
 if __name__ == '__main__':
