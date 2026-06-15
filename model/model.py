@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 #----------------------------------------------------------------------------------------------------------------------------------#
+
 @dataclass
 class Configuration:
     block_size : int = 1024
@@ -13,6 +14,37 @@ class Configuration:
     n_head : int = 12
     n_inner : int = 3072
 
+
+class RoPE(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        head_size = config.n_embd // config.n_head
+        theta = 1.0 / (10000 ** (torch.arange(0, head_size, 2).float() / head_size)) #frequence of each subspace (head_size/2)
+        pos = torch.arange(0, config.block_size).float() 
+        angles = torch.outer(pos, theta)  # position m, rotate (m*theta) degrees;  T * (head_size/2)
+        # save as cos and sin
+        self.register_buffer('cos', angles.cos())
+        self.register_buffer('sin', angles.sin())
+        #register_buffer: used to save a part of model state dict but not learnable parameters
+        #not a part of the optimization
+
+    def rotate(self, x):
+         # x(q,k): B * n_head * T * head_size
+        x1 = x[:,:,:, 0::2]  # even dimensions  B * n_head * T * (head_size/2)
+        x2 = x[:,:,:, 1::2]  # odd dimensions   B * n_head * T * (head_size/2)
+        cos = self.cos[:x.size(2), :] #T * (head_size/2)
+        sin = self.sin[:x.size(2), :] #T * (head_size/2)
+        x_rot = torch.stack([
+            x1 * cos - x2 * sin,
+            x1 * sin + x2 * cos
+        ], dim=-1) # B * n_head * T * (head_size/2) * 2
+        x_rot = x_rot.flatten(-2) #B * n_head * T * head_size
+        return x_rot
+
+    def forward(self, q, k):
+        return self.rotate(q), self.rotate(k)
+    
 
 class ffw(nn.Module):
 
@@ -38,6 +70,7 @@ class attention(nn.Module):
         self.n_embd = config.n_embd
         self.n_head = config.n_head
         self.head_size =  self.n_embd // self.n_head
+        self.rope = RoPE(config)
     
     def forward (self, x):
         B, T, C= x.size()
@@ -49,6 +82,7 @@ class attention(nn.Module):
         k = k.transpose(1, 2)  # B * n_head * T * head_size
         v = v.reshape(B, T, self.n_head, self.head_size)  # B * T * n-head * head_size            
         v = v.transpose(1, 2)  # B * n_head * T * head_size
+        q, k = self.rope(q, k)
         out = F.scaled_dot_product_attention(q,k,v, is_causal=True)  # flash attention
         out = out.transpose(1, 2)
         out = out.reshape(B, T ,C)
@@ -60,9 +94,9 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln1 = nn.LayerNorm(config.n_embd)
+        self.ln1 = nn.RMSNorm(config.n_embd)
         self.attention = attention(config)
-        self.ln2 = nn.LayerNorm(config.n_embd)
+        self.ln2 = nn.RMSNorm(config.n_embd)
         self.ffw = ffw(config)
     
     def forward(self, x):
@@ -79,9 +113,8 @@ class Model(nn.Module):
 
         self.transformer = nn.ModuleDict({
             'wte' : nn.Embedding(config.vocab_size, config.n_embd), #token embd 
-            'wpe' : nn.Embedding(config.block_size, config.n_embd), #position embd
             'h' : nn.ModuleList(Block(config) for _ in range(config.n_layer)), #hidden layers
-            'ln' : nn.LayerNorm(config.n_embd), # layer normalization 
+            'ln' : nn.RMSNorm(config.n_embd), # layer normalization 
             }
         )
         self.lp = nn.Linear (config.n_embd, config.vocab_size, bias = False)  # softmax (x+c) == softmax（x） 
@@ -90,11 +123,9 @@ class Model(nn.Module):
 
     def forward(self, idx, target = None):
         B, T = idx.size()
-        pos = torch.arange(0, T, dtype=torch.long, device = idx.device)
         tok_embd = self.transformer.wte(idx)
-        pos_embd = self.transformer.wpe(pos)
 
-        x = tok_embd + pos_embd
+        x = tok_embd 
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln(x)
@@ -107,14 +138,15 @@ class Model(nn.Module):
             loss = None
         return logits, loss
 
-
 #----------------------------------------------------------------------------------------------------------------------------------#
+
 @dataclass
 class Data_config:
     data_dir : str = r'C:\Users\xhu70\Documents\LLM_from_scratch\bpe\books_data_final.bin'
     out_dir :str = r'C:\Users\xhu70\Documents\LLM_from_scratch\out'
 
 # ----------------------------------------------------------------------------
+
 @dataclass 
 class Train_config:
     batch_size : int = 4
@@ -200,7 +232,7 @@ def train():
                 val_x, val_y = get_batch(val_data, model_config.block_size, train_config.batch_size, device)
                 with torch.no_grad():
                     _, val_loss_batch = model(val_x, target=val_y)
-                val_loss += val_loss_batch.item()  # gradient accumulation
+                val_loss += val_loss_batch.item()  
             val_loss /= eval_iters
             print(f"=====================")
             print(f"Iter {it} | Val loss: {val_loss:.4f}")
