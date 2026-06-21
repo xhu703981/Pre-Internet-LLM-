@@ -2,7 +2,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn 
 from torch.nn import functional as F
-
+import os
+from dotenv import load_dotenv
+load_dotenv()
 #----------------------------------------------------------------------------------------------------------------------------------#
 
 @dataclass
@@ -12,7 +14,7 @@ class Configuration:
     n_embd : int = 768 
     n_layer : int = 12
     n_head : int = 12
-    n_inner : int = 3072
+    #n_inner : int = 3072
     n_swi : int = 2048
 
 
@@ -154,14 +156,15 @@ class Model(nn.Module):
 
 @dataclass
 class Data_config:
-    data_dir : str = r'C:\Users\xhu70\Documents\LLM_from_scratch\bpe\books_data_final.bin'
-    out_dir :str = r'C:\Users\xhu70\Documents\LLM_from_scratch\out'
+    data_dir : str = os.environ.get('DATA_DIR', './data/books_data_final.bin')
+    out_dir : str = os.environ.get('OUT_DIR', './out')
 
 # ----------------------------------------------------------------------------
 
 @dataclass 
 class Train_config:
     batch_size : int = 4
+    grad_accum_step : int = 8
     max_iters : int = 100000
     lr : float = 3e-4
 
@@ -170,6 +173,7 @@ class Train_config:
     min_lr: float = 3e-5
 
     eval_interval: int = 2000
+    ckpt_interval : int = 1000
 
 
 def get_lr(iter, config = Train_config()):
@@ -191,6 +195,36 @@ def get_batch(data, block_size, batch_size, device):
     return x.to(device), y.to(device)
 
 
+def _raw_state_dict(model):
+    """
+    Strip the '_orig_mod.' prefix that torch.compile() adds to state_dict keys.
+    This keeps checkpoints loadable into either a compiled or uncompiled model.
+    """
+    sd = model.state_dict()
+    cleaned = {}
+    for k, v in sd.items():
+        cleaned[k.replace('_orig_mod.', '')] = v
+    return cleaned
+
+
+def save_ckpt(path, model, optimizer, iter_num, best_val_loss):
+    ckpt = {
+         'model' : _raw_state_dict(model),
+         'optimizer' : optimizer.state_dict(),
+         'iter_num' : iter_num,  # so the loop resumes at the right iter
+         'best_val_loss' : best_val_loss,
+    }
+    torch.save(ckpt, path)
+    print(f"saved checkpoint to {path} (iter {iter_num})")
+
+
+def load_checkpoint(path, device):
+    # weights_only=False because this checkpoint contains the dataclass config object
+    # and optimizer state, not just tensors. Only load checkpoints you trust/created yourself.
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    return checkpoint
+
+
 def train():
     import os 
     import numpy as np
@@ -201,45 +235,76 @@ def train():
 
     os.makedirs(data_config.out_dir, exist_ok=True)
 
+    last_ckpt_path = os.path.join(data_config.out_dir, 'last_model.pt')
+    best_ckpt_path = os.path.join(data_config.out_dir, 'best_model1.pt')
+
     data = np.memmap(data_config.data_dir, dtype='uint16', mode='r')
     n = int(len(data) * 0.8)
     train_data = data[:n]
     val_data   = data[n:]
 
-    model = Model(model_config).to('cuda' if torch.cuda.is_available() else 'cpu')
-    device = next(model.parameters()).device
-
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = Model(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
     best_val_loss = float('inf')
+    starting_iter = 0
+
+    resume_path = None
+    if os.path.exists(last_ckpt_path):
+        resume_path = last_ckpt_path
+    if resume_path is not None: 
+        print(f"resuming from : {resume_path}")
+        checkpoint = load_checkpoint(resume_path, device)
+        model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        starting_iter = checkpoint['iter_num'] + 1
+        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        print(f"resumed at iter {starting_iter}, best_val_loss so far: {best_val_loss:.4f}")
+    else:
+        print(f'starting from zero')
+
+
+    #model = torch.compile(model=model)
+    device = next(model.parameters()).device
+
+
 
     print('start training')
     print(f"CUDA available: {torch.cuda.is_available()}")
     print(f"Device: {device}")
 
 
-    for it in range(train_config.max_iters):
+    for it in range(starting_iter, train_config.max_iters):
         model.train()  #train mode
 
-        x, y = get_batch(train_data, model_config.block_size, train_config.batch_size, device)
 
         lr = get_lr(it)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-        
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):  #mixed precision
-            logits, loss = model(x, target=y)
+
         optimizer.zero_grad()
-        loss.backward()
+        accum_loss = 0.0
+        for micro_step in range(train_config.grad_accum_step):
+            x, y = get_batch(train_data, model_config.block_size, train_config.batch_size, device)
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):  #mixed precision
+                logits, loss = model(x, target=y)
+            loss = loss / train_config.grad_accum_step
+            accum_loss += loss.item()
+            loss.backward()
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  #gradient clipping
         optimizer.step()
         
-        print(f"Iter {it} | loss: {loss.item():.4f} | lr: {lr:.2e}")
+        print(f"Iter {it} | loss: {accum_loss:.4f} | lr: {lr:.2e}")
+
+        if it % train_config.ckpt_interval == 0 and it != 0:
+            save_ckpt(last_ckpt_path, model, optimizer, it, best_val_loss)
 
         if it % train_config.eval_interval == 0 and it != 0:
             model.eval()
 
             val_loss = 0.0
-            eval_iters = 50
+            eval_iters = 100
             for i in range(eval_iters):
                 val_x, val_y = get_batch(val_data, model_config.block_size, train_config.batch_size, device)
                 with torch.no_grad():
@@ -252,7 +317,9 @@ def train():
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                torch.save(model.state_dict(), os.path.join(data_config.out_dir, 'best_model1.pt'))
+                save_ckpt(best_ckpt_path, model, optimizer, it, best_val_loss)
+
+    save_ckpt(last_ckpt_path, model, optimizer, train_config.max_iters - 1, best_val_loss)
 
 
 if __name__ == '__main__':
