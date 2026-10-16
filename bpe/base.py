@@ -7,6 +7,13 @@ from multiprocessing import Pool
 
 GPT2_REGEX = re.compile(r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+""")
 
+def clean_text(text):
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r'(?<=[a-z,;])\n(?=[a-z])', ' ', text)
+    text = re.sub(r' {2,}', ' ', text)
+    return text.strip()
+
 class Tokenizer:
 
     def __init__(self):
@@ -41,7 +48,9 @@ class Tokenizer:
         txt_files = sorted(glob.glob(os.path.join(data_dir, "*.txt")))
         for file_idx, path in enumerate(txt_files):
             with open(path, 'r', encoding='utf-8') as f:
-                for line in f:    #interator ; memory is cleared after done
+                text = f.read()
+                text = clean_text(text)
+                for line in text.split('\n'):    #interator ; memory is cleared after done
                     line_cnt += 1
                     tokens = GPT2_REGEX.findall(line)
                     tokens = [t for t in tokens if t] # null char
@@ -55,8 +64,10 @@ class Tokenizer:
         pair_freq = {}  #token pair frequencey counter
         pair_to_words = {}  # looking for token pair in all words is very expensive; we create this dict as an index to know what words to look at for particular tokens 
     
-
+        cntt =0
         for byte_tuple, freq in word_freq.items():
+            cntt +=1
+            print(f'processing {cntt} token')
             for i in range (len(byte_tuple) -1):
                 pair = (byte_tuple[i], byte_tuple[i+1])
                 pair_freq[pair] = pair_freq.get(pair, 0) + freq   # ‘the cat the dog' : {(116, 104): 2, (104, 101): 2, (32, 99): 1, (99, 97): 1, (97, 116): 1, (32, 116): 1, (32, 100): 1, (100, 111): 1, (111, 103): 1}
@@ -219,7 +230,7 @@ class Tokenizer:
 
 
 #-------------------------------------------------------------------------------------------------------------------
-#tokenizer = Tokenizer()
+# tokenizer = Tokenizer()
 # tokenizer.train(r'C:\Users\xhu70\Documents\LLM_from_scratch\data', vocab_size=50304)
 # tokenizer.save('my_tokenizer.json')
 # tokenizer.encode('hellow world')

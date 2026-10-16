@@ -3,6 +3,16 @@ import numpy as np
 import os
 import glob
 from base import Tokenizer
+import re
+
+def clean_text(text):
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+    text = re.sub(r'\n{3,}', '\n\n', text) # fold 3+ consecutive \n
+    text = re.sub(r'(?<=[a-z,;])\n(?=[a-z])', ' ', text)  #remove unnecessary \n
+    text = re.sub(r' {2,}', ' ', text)
+
+    return text.strip()
 
 def worker_encode_init(tokenizer_path): # 
     # in python, data are transimitted among thredas with pickle
@@ -17,9 +27,11 @@ def process_file(filepath):
     global worker_tokenizer
     ids = []
     with open(filepath, 'r', encoding='utf-8') as f:
-        for idx, line in enumerate(f):
-            line_ids = worker_tokenizer.encode(line)
-            ids.extend(line_ids)
+        text = f.read()              # 读整个文件内容
+        text = clean_text(text)
+    for line in text.split('\n'):
+        line_ids = worker_tokenizer.encode(line)
+        ids.extend(line_ids)
 
             # if (idx+1) %100 ==0:
             #     print(f" processed {idx+1} lines", flush=True)s

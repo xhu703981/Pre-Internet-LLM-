@@ -156,7 +156,10 @@ class Model(nn.Module):
 
 @dataclass
 class Data_config:
-    data_dir : str = os.environ.get('DATA_DIR', './data/books_data_final.bin')
+    data_dir : str = os.environ.get(
+        'DATA_DIR',
+        os.path.join(os.path.dirname(__file__), '..', 'data', 'processed', 'institutional_books_ocr_gt_90_pre1940_50304.bin'),
+    )
     out_dir : str = os.environ.get('OUT_DIR', './out')
 
 # ----------------------------------------------------------------------------
